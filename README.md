@@ -13,7 +13,7 @@ Please refer to sections 5 and 6 in the paper for details on workflow and experi
 - Matplotlib
 
 ## Usage
-Run the script
+Run the script. 
 The description of the variables in these codes will be added at a later date.
 
 ## License

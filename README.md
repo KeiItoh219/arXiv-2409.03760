@@ -1,7 +1,7 @@
 # README
 This repository contains the source code for the paper:
-"Rethinking Deep Learning: Propagating Information in Neural Networks without Backpropagation and Statistical Optimization"
-https://doi.org/10.48550/arXiv.2409.03760
+"Rethinking Deep Learning: Non-backpropagation and Non-optimization Machine Learning Approach Using Hebbian Neural Networks"
+https://arxiv.org/abs/2411.05861
 
 ## Workflow
 Please refer to sections 5 and 6 in the paper for details on workflow and experimental setup. 

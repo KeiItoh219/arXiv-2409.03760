@@ -3,16 +3,18 @@
 # This software is released under the MIT License.
 # https://opensource.org/licenses/MIT
 
-import torch  
+import numpy as np
+import os
+import torch
 import torchvision
 from torchvision import transforms
 from torch.utils.data import DataLoader, Subset
-import numpy as np
-from tqdm import tqdm 
+from tqdm import tqdm
 import random
+import pandas as pd
 import matplotlib.pyplot as plt
-import winsound 
-import os
+import math
+from collections import defaultdict
 
 # GPUが利用可能かどうかを確認し、利用可能であればGPUを使用 Check if GPU is available and if so, use GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -20,6 +22,9 @@ print(f'Using device: {device}')
 
 # 浮動小数点の精度を倍精度に設定 Set floating point precision to double precision
 torch.set_default_dtype(torch.float64)
+
+# 全データの結果保存のオンオフ切り替え On/off toggle data results storage
+save_all_data_results = False  # Trueで全データの結果を保存、Falseでスキップ True to save results for all data, false to skip
 
 # シード値の設定関数 Seed value setting function
 def set_seed(seed):
@@ -33,7 +38,8 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 # シード値の設定 Seed value setting
-seed_value = 42 
+seed_value = 42
+set_seed(seed_value)
 
 # データの正規化関数 Data Normalization Functions
 def normalize_data(tensor):
@@ -46,10 +52,9 @@ def get_transform(normalize=True):
         transform_list.append(transforms.Lambda(lambda x: normalize_data(x)))
     return transforms.Compose(transform_list)
 
-
 # データセットをラベルごとに制限する関数 Function to restrict the data set by label
 def limit_dataset_by_label(dataset, min_count):
-    label_indices = {i: [] for i in range(10)}
+    label_indices = defaultdict(list)
     for idx, (_, label) in enumerate(dataset):
         if len(label_indices[label]) < min_count:
             label_indices[label].append(idx)
@@ -57,18 +62,13 @@ def limit_dataset_by_label(dataset, min_count):
     return Subset(dataset, limited_indices)
 
 # MNISTデータの読み込みと前処理 MNIST data loading and preprocessing
-train_dataset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=get_transform)
-test_dataset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=get_transform)
+train_dataset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=get_transform(normalize=True))
+test_dataset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=get_transform(normalize=True))
 train_dataset = limit_dataset_by_label(train_dataset, min_count=5420)
 
 # データローダーを作成（学習時に各データ毎にヘブ学習させるためバッチサイズを1に設定）Create a data loader (set batch size to 1 in order to hebtrain each data at training time)
 train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
-
-# 各ラベルごとにデータセットをフィルタリング Filter dataset by each label
-label_datasets = {i: [] for i in range(10)}
-for data, target in train_dataset:
-    label_datasets[target].append((data, target))
 
 # ステップ関数の定義 Step function definition
 def step_function(x):
@@ -76,7 +76,7 @@ def step_function(x):
 
 # ニューラルネットワークの定義(隠れ層の数num_hidden_layersを可変的に変更可能) Definition of Neural Network (the number of hidden layers; num_hidden_layers can be changed)
 class FlexibleNetwork(torch.nn.Module):
-    def __init__(self, input_size=784, hidden_size=784, output_size=784, num_hidden_layers=3, activation_function='relu'):
+    def __init__(self, input_size=784, hidden_size=784, output_size=784, num_hidden_layers=4, activation_function='relu'):
         super(FlexibleNetwork, self).__init__()
         self.num_hidden_layers = num_hidden_layers
         self.activation_function = activation_function
@@ -101,14 +101,13 @@ class FlexibleNetwork(torch.nn.Module):
         output = self.output_layer(activations[-1])
         return activations, output
     #重み更新のためのヘブ学習則の定義 Definition of Hebbian learning rule for weight update
-    def update_weights(self, activations, learning_rate=0.0000001):
-        for i in range(1, self.num_hidden_layers):  # 隠れ層間の重みを更新 Update weights between hidden layers
-            prev_activation = activations[i].view(-1)  # i層の活性化状態 Activation state of the i layer
-            next_activation = activations[i + 1].view(-1)  # i+1層の活性化状態 Activation state of the i+1 layer
+    def update_weights(self, activations, learning_rate=0.000001):
+        for i in range(1, self.num_hidden_layers): # 隠れ層間の重みを更新 Update weights between hidden layers
+            prev_activation = activations[i].view(-1) # i層の活性化状態 Activation state of the i layer
+            next_activation = activations[i + 1].view(-1) # i+1層の活性化状態 Activation state of the i+1 layer
 
             if prev_activation.dim() != 1 or next_activation.dim() != 1:
                 raise RuntimeError("Activations must be 1-D vectors.")
-            
             delta_w = learning_rate * torch.ger(next_activation, prev_activation) #活性化状態同士の行列積 Matrix product of activation states
             self.hidden_layers[i].weight.data += delta_w #重み更新 weight update
             #重みの無制限強化を防ぐ補正 Correction to prevent unlimited enhancement of weights
@@ -118,155 +117,188 @@ class FlexibleNetwork(torch.nn.Module):
             self.hidden_layers[i].weight.data -= average_weight_update
 
 # モデルを訓練する関数 Function to train the model
-def train_model(loader, model):
+def train_model(loader, model, learning_rate=0.000001):
     model.train()
     with torch.no_grad():
         for data, _ in loader:
             data = data.to(device)
             activations, _ = model(data)
-            model.update_weights(activations)
+            model.update_weights(activations, learning_rate)
 
-# 出力ベクトルのノルムの大きさを比較し、テキストファイルに保存 Compare norm magnitudes of output vectors and save to text file
-def compare_output_magnitude(test_loader, model_all_data, model_untrained, model_uniform_data, label_models):
-    comparison_results = {
-        'all_vs_label': {i: 0 for i in range(10)},
-        'untrained_vs_label': {i: 0 for i in range(10)},
-        'uniform_vs_label': {i: 0 for i in range(10)},
-        'label_vs_others': {i: {j: 0 for j in range(10) if i != j} for i in range(10)}
-    }
-    total_counts = {i: 0 for i in range(10)}
+# 結果を保存する関数 Function to save the result
+def save_results(test_loader, models_per_label, hidden_layers, learning_rate, overall_accuracy, accuracy_per_label):
+    global overall_total, overall_correct  # グローバル変数を使用
+    folder_name = f"E:\\results\\hidden_layers_{hidden_layers}_lr_{learning_rate:.0e}"
+    if not os.path.exists(folder_name):
+        os.makedirs(folder_name)
 
-    model_all_data.eval()
-    model_untrained.eval()
-    model_uniform_data.eval()
-    for model in label_models.values():
-        model.eval()
-
-    # 保存ディレクトリの設定 Save directory settings
-    save_dir = "output_comparison_results"
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+    with open(os.path.join(folder_name, "accuracy_summary.txt"), "w") as summary_file:
+        summary_file.write(f"Overall Accuracy: {overall_accuracy:.2f}%\n")
+        for label, accuracy in accuracy_per_label.items():
+            summary_file.write(f"Accuracy for Label {label}: {accuracy:.2f}%\n")
 
     with torch.no_grad():
-        for idx, (data, targets) in enumerate(tqdm(test_loader, desc="Evaluating test data")):
+        for idx, (data, targets) in enumerate(tqdm(test_loader, desc="Processing test data results")):
             data = data.to(device)
-            label = targets.item()
-            _, outputs_all_data = model_all_data(data)
-            _, outputs_untrained = model_untrained(data)
-            _, outputs_uniform_data = model_uniform_data(data)
-            magnitudes_all_data = torch.norm(outputs_all_data, dim=1) #ノルム化 Norming all_data model
-            magnitudes_untrained = torch.norm(outputs_untrained, dim=1) #Norming untrained model
-            magnitudes_uniform_data = torch.norm(outputs_uniform_data, dim=1) #Norming uniform model
+            true_label = targets.item()
+            norms = {}
+            outputs = {}
+            valid_data = True  # 有効なデータかどうかのフラグ Flag if data is valid or not
 
-            model = label_models[label]
-            _, outputs_label = model(data)
-            magnitudes_label = torch.norm(outputs_label, dim=1)
+            for label in range(10):
+                model = models_per_label[label]
+                _, output = model(data)
 
-            total_counts[label] += 1
+                # 出力ベクトルとノルムにinfやnanが含まれていないかを確認 Check to see if the force vector and norm contain inf or nan
+                if not torch.isfinite(output).all():
+                    valid_data = False
+                    break
 
-            comparison_results['all_vs_label'][label] += (magnitudes_label > magnitudes_all_data).sum().item() #ノルムの大きさ比較　入力したデータのノルムが大きければカウントアップ Norm magnitude comparison If the norm of the input data is large, it is counted up.
-            comparison_results['untrained_vs_label'][label] += (magnitudes_label > magnitudes_untrained).sum().item()
-            comparison_results['uniform_vs_label'][label] += (magnitudes_label > magnitudes_uniform_data).sum().item()
+                norm = torch.norm(output, dim=1).item()
+                if not math.isfinite(norm):
+                    valid_data = False
+                    break
 
-            # 他ラベルモデルとの比較 Comparison with other label models
-            other_outputs = {}
-            other_magnitudes = {}
-            for other_label in range(10):
-                if other_label != label:
-                    model_other = label_models[other_label]
-                    _, outputs_other_label = model_other(data)
-                    magnitudes_other_label = torch.norm(outputs_other_label, dim=1)
-                    other_outputs[other_label] = outputs_other_label.cpu().numpy()
-                    other_magnitudes[other_label] = magnitudes_other_label.item()
-                    comparison_results['label_vs_others'][label][other_label] += (magnitudes_label > magnitudes_other_label).sum().item()
+                norms[label] = norm
+                outputs[label] = output
 
-            # 結果をテキストファイルに出力 Output results to a text file
-            file_path = os.path.join(save_dir, f"test_data_{idx}_label_{label}.txt")
-            with open(file_path, "w") as file:
-                #比較結果 Comparison Results
-                file.write(f"Test data label: {label}\n")
-                file.write(f"Base Norm (Label {label} Model): {magnitudes_label.item()}\n")
-                file.write(f"All Data Model Norm: {magnitudes_all_data.item()}\n")
-                file.write(f"Untrained Model Norm: {magnitudes_untrained.item()}\n")
-                file.write(f"Uniform Data Model Norm: {magnitudes_uniform_data.item()}\n")
-                for other_label, magnitude in other_magnitudes.items():
-                    file.write(f"Label {other_label} Model Norm: {magnitude}\n")
+            total_counts[true_label] += 1
+            overall_total += 1
 
-                # 出力ベクトル Output vector
-                file.write("\nOutput Vectors:\n")
-                file.write(f"Base Model (Label {label}) Output: {outputs_label.cpu().numpy()}\n")
-                file.write(f"All Data Model Output: {outputs_all_data.cpu().numpy()}\n")
-                file.write(f"Untrained Model Output: {outputs_untrained.cpu().numpy()}\n")
-                file.write(f"Uniform Data Model Output: {outputs_uniform_data.cpu().numpy()}\n")
-                file.write("Other Label Models Outputs:\n")
-                for other_label, other_output in other_outputs.items():
-                    file.write(f"  Label {other_label} Model Output: {other_output}\n")
+            if not valid_data:
+                continue
 
-    comparison_ratios = {
-        key: {i: (comparison_results[key][i] / total_counts[i]) * 100 if total_counts[i] > 0 else 0 for i in range(10)}
-        for key in ['all_vs_label', 'untrained_vs_label', 'uniform_vs_label']
-    }
+            # 予測ラベルは最大のノルムを持つラベル Predicted labels are labels with the largest norm
+            predicted_label = max(norms, key=norms.get)
+            predicted_norm = norms[predicted_label]
 
-    label_vs_others_ratios = {
-        label: {other_label: (comparison_results['label_vs_others'][label][other_label] / total_counts[label]) * 100 if total_counts[label] > 0 else 0 for other_label in comparison_results['label_vs_others'][label]}
-        for label in comparison_results['label_vs_others']
-    }
+            if predicted_label == true_label:
+                correct_counts[true_label] += 1
+                overall_correct += 1
 
-    return comparison_ratios, label_vs_others_ratios
+            # 結果の全保存 Save all results
+            if save_all_data_results:
+                file_path = os.path.join(folder_name, f"test_data_{idx}_label_{true_label}.txt")
+                with open(file_path, "w") as file:
+                    file.write(f"True Label: {true_label}\n")
+                    file.write(f"Predicted Label: {predicted_label} (Norm: {predicted_norm})\n\n")
+                    
+                    file.write("Norm Comparisons:\n")
+                    for label, norm in norms.items():
+                        comparison = "Higher" if label == predicted_label else "Lower"
+                        file.write(f"Label {label} Model Norm: {norm} - {comparison}\n")
 
-# グラフ描画関数 Graph Drawing Functions
-def plot_comparison_results(comparison_ratios, label_vs_others_ratios, save_dir="E:\\output_comparison_results\comparison_results"):
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+                    file.write("\nOutput Vectors:\n")
+                    for label, output in outputs.items():
+                        file.write(f"Label {label} Model Output: {output}\n")
 
-    for label in range(10):
-        fig, ax = plt.subplots(figsize=(10, 6))
+# 各種パラメータ設定 Various parameter settings
+hidden_layer_start = 2 #繰り返す最初の隠れ層数 First number of hidden layers
+hidden_layer_increment = 1 #隠れ層数の増加刻み Incremental ticks in the number of hidden layers
+num_hidden_layer_variants = 14 #隠れ層数を増やす数 Number to increase the hidden layers
+learning_rates = [10**(-i) for i in range(1, 9)] #学習率(range(1, 10)で10^-1 ~ 10^-8まで) #Learning rate (range(1, 10) from 10^-1 ~ 10^-8)
+hidden_layer_counts = [hidden_layer_start + i * hidden_layer_increment for i in range(num_hidden_layer_variants)]
 
-        all_vs_label = comparison_ratios['all_vs_label'][label]
-        untrained_vs_label = comparison_ratios['untrained_vs_label'][label]
-        uniform_vs_label = comparison_ratios['uniform_vs_label'][label]
+results = []
+#複数の隠れ層数と複数の学習率で繰り返し計算 Iterations with multiple hidden layer counts and multiple learning rates
+for num_hidden_layers in hidden_layer_counts:
+    for learning_rate in learning_rates:
+        print(f"Training models with {num_hidden_layers} hidden layers and learning rate {learning_rate}...")
+        models_per_label = {}
+         #各ラベルの個別学習NNs Individual training NNs for each label
+        for label in range(10):
+            set_seed(seed_value)
+            model = FlexibleNetwork(num_hidden_layers=num_hidden_layers, activation_function='relu').to(device)
+            label_data_loader = DataLoader([data for data in train_dataset if data[1] == label], batch_size=1, shuffle=True)
+            train_model(label_data_loader, model, learning_rate=learning_rate)
+            models_per_label[label] = model
 
-        others_vs_label = [label_vs_others_ratios[label][other_label] for other_label in label_vs_others_ratios[label]]
+        correct_counts = {i: 0 for i in range(10)}
+        total_counts = {i: 0 for i in range(10)}
+        overall_correct = 0
+        overall_total = 0
+         #全データに対して予測値計算と正答判断 Calculate predictions and determine correct answers for all data
+        with torch.no_grad():
+            for data, targets in tqdm(test_loader, desc=f"Evaluating models with {num_hidden_layers} hidden layers and learning rate {learning_rate}"):
+                data = data.to(device)
+                targets = targets.to(device)
 
-        model_labels = ['All Data', 'Untrained', 'Uniform'] + [f'Label {other}' for other in range(10) if other != label]
-        values = [all_vs_label, untrained_vs_label, uniform_vs_label] + others_vs_label
+                magnitudes = []
+                valid_data = True
+                #各ラベルの出力ベクトルノルム計算 Output vector norm calculation for each label
+                for label in range(10):
+                    model = models_per_label[label]
+                    _, outputs_label = model(data)
+                    if not torch.isfinite(outputs_label).all():
+                        valid_data = False
+                        break
+                    magnitudes.append(torch.norm(outputs_label, dim=1).item()) #ノルム計算
 
-        ax.bar(model_labels, values, color='b', alpha=0.7)
-        ax.set_xlabel('Models', fontsize=12)
-        ax.set_ylabel('Vector Norm Magnitude Comparison Ratio (%)', fontsize=14)
-        plt.xticks(rotation=45, ha='right')
-        plt.tight_layout()
-        save_path = os.path.join(save_dir, f'comparison_label_{label}.svg')
-        plt.savefig(save_path, format='svg')
-        plt.close()
+                total_counts[targets.item()] += 1
+                overall_total += 1
+                if not valid_data:
+                    continue
 
-# 各モデルの作成と学習 Creation and study of each model
-set_seed(seed_value)
-model_untrained = FlexibleNetwork(activation_function='relu').to(device)
+                predicted_label = np.argmax(magnitudes) #予測値はノルムが最も大きいラベル Prediction is label with the largest norm
 
-set_seed(seed_value)
-model_all_data = FlexibleNetwork(activation_function='relu').to(device)
-train_model(train_loader, model_all_data)
+                if predicted_label == targets.item():
+                    correct_counts[targets.item()] += 1
+                    overall_correct += 1
 
-set_seed(seed_value)
-model_uniform_data = FlexibleNetwork(activation_function='relu').to(device)
-uniform_data = []
+        accuracy_per_label = {label: (correct_counts[label] / total_counts[label]) * 100 if total_counts[label] > 0 else 0 for label in range(10)}
+        overall_accuracy = (overall_correct / overall_total) * 100 if overall_total > 0 else 0
+
+        results.append({
+            'hidden_layers': num_hidden_layers,
+            'learning_rate': learning_rate,
+            'overall_accuracy': overall_accuracy,
+            'accuracy_per_label': accuracy_per_label
+        })
+
+        save_results(test_loader, models_per_label, num_hidden_layers, learning_rate, overall_accuracy, accuracy_per_label)
+
+graph_folder = 'results\\accuracy_graphs'
+os.makedirs(graph_folder, exist_ok=True)
+
+# 正答率をCSVファイルに保存 Save the percentage of correct answers to a CSV file
+results_df = pd.DataFrame(results)
+results_df.to_csv(os.path.join(graph_folder, 'accuracy_results.csv'), index=False)
+
+# 全体およびラベル別正答率のグラフ生成 Graph generation of overall and label-specific percentages of correct answers
+hidden_layers_array = np.array(hidden_layer_counts)
+learning_rates_array = np.array(learning_rates)
+overall_accuracy_matrix = np.zeros((len(learning_rates), len(hidden_layer_counts)))
+
+for i, lr in enumerate(learning_rates):
+    for j, hl in enumerate(hidden_layer_counts):
+        for result in results:
+            if result['hidden_layers'] == hl and result['learning_rate'] == lr:
+                overall_accuracy_matrix[i, j] = result['overall_accuracy']
+
+plt.figure(figsize=(8, 6))
+plt.contourf(hidden_layers_array, learning_rates_array, overall_accuracy_matrix, levels=20, cmap='viridis', vmin=0, vmax=100)
+cbar = plt.colorbar()
+cbar.set_label('Overall Accuracy (%)', fontsize=12)
+plt.xlabel('Number of Hidden Layers', fontsize=14)
+plt.ylabel('Learning Rate', fontsize=14)
+plt.yscale('log')
+plt.savefig(os.path.join(graph_folder, 'overall_accuracy_contour.svg'), format='svg')
+plt.close()
+
 for label in range(10):
-    label_data = label_datasets[label]
-    sample_size = len(label_data) // 10
-    uniform_data.extend(random.sample(label_data, sample_size))
-uniform_loader = DataLoader(uniform_data, batch_size=1, shuffle=True)
-train_model(uniform_loader, model_uniform_data)
+    label_accuracy_matrix = np.zeros((len(learning_rates), len(hidden_layer_counts)))
+    for i, lr in enumerate(learning_rates):
+        for j, hl in enumerate(hidden_layer_counts):
+            for result in results:
+                if result['hidden_layers'] == hl and result['learning_rate'] == lr:
+                    label_accuracy_matrix[i, j] = result['accuracy_per_label'][label]
 
-models_per_label = {}
-for label in range(10):
-    set_seed(seed_value)
-    model = FlexibleNetwork(activation_function='relu').to(device)
-    label_data_loader = DataLoader([data for data in train_dataset if data[1] == label], batch_size=1, shuffle=True)
-    train_model(label_data_loader, model)
-    models_per_label[label] = model
-
-comparison_ratios, label_vs_others_ratios = compare_output_magnitude(test_loader, model_all_data, model_untrained, model_uniform_data, models_per_label)
-plot_comparison_results(comparison_ratios, label_vs_others_ratios)
-
-winsound.Beep(1000, 1000)  # 周波数1000Hz、1秒間ビープ音を鳴らす
+    plt.figure(figsize=(8, 6))
+    plt.contourf(hidden_layers_array, learning_rates_array, label_accuracy_matrix, levels=20, cmap='viridis', vmin=0, vmax=100)
+    cbar = plt.colorbar()
+    cbar.set_label(f'Accuracy for Label {label} (%)', fontsize=12)
+    plt.xlabel('Number of Hidden Layers', fontsize=14)
+    plt.ylabel('Learning Rate', fontsize=14)
+    plt.yscale('log')
+    plt.savefig(os.path.join(graph_folder, f'label_{label}_accuracy_contour.svg'), format='svg')
+    plt.close()

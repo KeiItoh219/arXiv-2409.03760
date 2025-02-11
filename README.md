@@ -4,7 +4,7 @@ This repository contains the source code for the paper:
 https://arxiv.org/abs/2411.05861
 
 ## Workflow
-Please refer to sections 5 and 6 in the paper for details on workflow and experimental setup. 
+Please refer to sections 4 and 5 in the paper for details on workflow and experimental setup. 
 
 ## Requirements(The version is the development environment)
 - Python 3.10.11
